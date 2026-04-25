@@ -1,534 +1,709 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   AreaChart, Area, BarChart, Bar, LineChart, Line,
-  XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid
+  XAxis, YAxis, Tooltip, ResponsiveContainer,
 } from "recharts";
 
-const MOCK_SESSIONS = [
-  { id: "172_19_0_1", ip: "172.19.0.1", protocol: "ssh", score: 4, level: 3, events: 17, last_seen: "01:08:50", status: "active" },
-  { id: "10_0_2_44", ip: "10.0.2.44", protocol: "ssh", score: 2, level: 2, events: 8, last_seen: "00:45:12", status: "idle" },
-  { id: "192_168_1_5", ip: "192.168.1.5", protocol: "http", score: 1, level: 1, events: 3, last_seen: "00:32:07", status: "idle" },
-  { id: "10_0_2_98", ip: "10.0.2.98", protocol: "ssh", score: 5, level: 3, events: 23, last_seen: "01:02:33", status: "active" },
-  { id: "172_16_0_3", ip: "172.16.0.3", protocol: "http", score: 0, level: 1, events: 2, last_seen: "00:18:45", status: "closed" },
-];
+// ─── CONFIG ────────────────────────────────────────────────────────────────
+const INGESTION_URL = "https://ingestion-production-c968.up.railway.app";
+const POLL_INTERVAL = 5000; // ms
 
-const MOCK_EVENTS = [
-  { time: "01:08:50", type: "connection_closed", username: null, detail: "Session ended" },
-  { time: "01:05:50", type: "command_input", username: null, detail: "ls" },
-  { time: "01:05:12", type: "command_input", username: null, detail: "(empty)" },
-  { time: "01:04:01", type: "connection_new", username: null, detail: "New SSH connection" },
-  { time: "01:04:00", type: "authentication_success", username: "root", detail: "Login as root" },
-  { time: "01:03:31", type: "cowrie.client.kex", username: null, detail: "Key exchange" },
-  { time: "01:03:31", type: "connection_new", username: null, detail: "New SSH connection" },
-  { time: "00:56:56", type: "connection_closed", username: null, detail: "Session ended" },
-  { time: "22:42:23", type: "command_input", username: null, detail: "exit" },
-  { time: "22:42:14", type: "command_input", username: null, detail: "ls" },
-  { time: "22:42:11", type: "command_input", username: null, detail: "mkdir aladdin" },
-  { time: "22:42:05", type: "command_input", username: null, detail: "ls" },
-  { time: "22:41:58", type: "authentication_success", username: "root", detail: "Login as root" },
-];
-
-const MOCK_DECISIONS = [
-  { rule: "high_skill_persistent_attacker", action: "escalate_to_level_3", score: 4, time: "01:05:14" },
-  { rule: "ssh_successful_login", action: "escalate_to_level_3", score: 4, time: "01:04:02" },
-  { rule: "ssh_root_attempt", action: "flag", score: 1, time: "01:04:02" },
-  { rule: "high_skill_persistent_attacker", action: "escalate_to_level_3", score: 0, time: "01:03:34" },
-];
-
-const MOCK_KG = {
-  nodes: [
-    { id: "172_19_0_1", type: "session", x: 340, y: 160 },
-    { id: "evt_auth", type: "event", x: 180, y: 280, label: "auth_success" },
-    { id: "evt_cmd1", type: "event", x: 340, y: 300, label: "command_input" },
-    { id: "evt_cmd2", type: "event", x: 500, y: 280, label: "command_input" },
-    { id: "rule_ssh_root", type: "rule", x: 120, y: 160, label: "ssh_root_attempt" },
-    { id: "rule_persistent", type: "rule", x: 560, y: 160, label: "persistent_attacker" },
-    { id: "rule_login", type: "rule", x: 340, y: 60, label: "ssh_successful_login" },
-  ],
-  edges: [
-    { src: "172_19_0_1", dst: "evt_auth", rel: "has_event" },
-    { src: "172_19_0_1", dst: "evt_cmd1", rel: "has_event" },
-    { src: "172_19_0_1", dst: "evt_cmd2", rel: "has_event" },
-    { src: "evt_auth", dst: "rule_ssh_root", rel: "matches_rule" },
-    { src: "evt_auth", dst: "rule_login", rel: "matches_rule" },
-    { src: "evt_cmd1", dst: "rule_persistent", rel: "matches_rule" },
-    { src: "172_19_0_1", dst: "rule_persistent", rel: "triggered_rule" },
-    { src: "172_19_0_1", dst: "rule_login", rel: "triggered_rule" },
-  ],
+// ─── HELPERS ───────────────────────────────────────────────────────────────
+const fmt = (ts) => {
+  if (!ts) return "—";
+  try { return new Date(ts).toLocaleTimeString("en-GB", { hour12: false }); }
+  catch { return ts; }
 };
-
-const TIMELINE_DATA = [
-  { hour: "22:00", events: 4 }, { hour: "23:00", events: 8 }, { hour: "00:00", events: 3 },
-  { hour: "01:00", events: 12 }, { hour: "01:05", events: 6 }, { hour: "01:08", events: 2 },
-];
-
-const RULES_DATA = [
-  { name: "high_skill", count: 7 }, { name: "ssh_login", count: 4 },
-  { name: "ssh_root", count: 3 }, { name: "brute_force", count: 2 }, { name: "port_scan", count: 1 },
-];
-
-const POOL_DATA = [
-  { name: "level1_pool", total: 5, busy: 1, idle: 4 },
-  { name: "level2_pool", total: 3, busy: 1, idle: 2 },
-  { name: "level3_pool", total: 1, busy: 1, idle: 0 },
-];
 
 const EVENT_COLORS = {
-  authentication_success: "#10b981",
-  authentication_failed: "#ef4444",
-  command_input: "#3b82f6",
-  connection_new: "#8b5cf6",
-  connection_closed: "#6b7280",
-  "cowrie.client.kex": "#f59e0b",
-  "cowrie.client.size": "#f59e0b",
-  "cowrie.client.version": "#f59e0b",
+  "cowrie.login.success":    "#10b981",
+  "cowrie.login.failed":     "#ef4444",
+  "cowrie.command.input":    "#3b82f6",
+  "cowrie.session.connect":  "#8b5cf6",
+  "cowrie.session.closed":   "#6b7280",
+  "cowrie.client.kex":       "#f59e0b",
+  "cowrie.client.version":   "#f59e0b",
+  "cowrie.session.params":   "#94a3b8",
+  "cowrie.client.size":      "#94a3b8",
+  "cowrie.log.closed":       "#64748b",
+  "authentication_success":  "#10b981",
+  "authentication_failed":   "#ef4444",
+  "command_input":           "#3b82f6",
+  "connection_new":          "#8b5cf6",
+  "connection_closed":       "#6b7280",
+  "ssh":                     "#8b5cf6",
+  "http":                    "#3b82f6",
 };
 
-const LEVEL_COLORS = { 1: "#10b981", 2: "#f59e0b", 3: "#ef4444" };
-const LEVEL_BG = { 1: "#d1fae5", 2: "#fef3c7", 3: "#fee2e2" };
+const eventColor = (type) =>
+  EVENT_COLORS[type] || EVENT_COLORS[type?.split(".")[0]] || "#94a3b8";
 
+// Build a session map from a flat event list
+function buildSessions(events) {
+  const map = {};
+  events.forEach((e) => {
+    const ip = e.src_ip || "unknown";
+    const sid = e.session_id || ip;
+    if (!map[sid]) {
+      map[sid] = {
+        id: sid,
+        ip,
+        protocol: e.protocol || "ssh",
+        events: [],
+        firstSeen: e.timestamp,
+        lastSeen: e.timestamp,
+        username: null,
+        commands: [],
+      };
+    }
+    map[sid].events.push(e);
+    if (e.timestamp > map[sid].lastSeen) map[sid].lastSeen = e.timestamp;
+    if (e.username) map[sid].username = e.username;
+    if (e.command) map[sid].commands.push(e.command);
+  });
+
+  return Object.values(map).map((s) => {
+    const hasSuccess = s.events.some((e) =>
+      e.event_type?.includes("login.success") ||
+      e.event_type?.includes("authentication_success")
+    );
+    const hasFailed = s.events.some((e) =>
+      e.event_type?.includes("login.failed") ||
+      e.event_type?.includes("authentication_failed")
+    );
+    const score = Math.min(5,
+      (hasSuccess ? 3 : 0) +
+      (s.commands.length > 2 ? 1 : 0) +
+      (s.events.length > 10 ? 1 : 0)
+    );
+    const level = score >= 4 ? 3 : score >= 2 ? 2 : 1;
+    return { ...s, score, level, eventCount: s.events.length };
+  }).sort((a, b) => b.lastSeen?.localeCompare(a.lastSeen));
+}
+
+// Build hourly activity buckets from events
+function buildTimeline(events) {
+  const buckets = {};
+  events.forEach((e) => {
+    if (!e.timestamp) return;
+    try {
+      const d = new Date(e.timestamp);
+      const key = `${String(d.getUTCHours()).padStart(2,"0")}:${String(Math.floor(d.getUTCMinutes()/15)*15).padStart(2,"0")}`;
+      buckets[key] = (buckets[key] || 0) + 1;
+    } catch {}
+  });
+  return Object.entries(buckets).sort().slice(-12).map(([hour, events]) => ({ hour, events }));
+}
+
+// Count event types
+function buildTypeCounts(events) {
+  const counts = {};
+  events.forEach((e) => {
+    const t = e.event_type || "unknown";
+    counts[t] = (counts[t] || 0) + 1;
+  });
+  return Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 7)
+    .map(([name, count]) => ({ name: name.replace("cowrie.", "").replace(/_/g, " "), full: name, count }));
+}
+
+// ─── SCORE DOT ─────────────────────────────────────────────────────────────
 function ScoreDot({ score }) {
   const colors = ["#6b7280","#10b981","#f59e0b","#f97316","#ef4444","#dc2626"];
   return (
     <div style={{ display: "flex", gap: 3, alignItems: "center" }}>
       {[0,1,2,3,4,5].map(i => (
-        <div key={i} style={{ width: 8, height: 8, borderRadius: "50%", background: i <= score ? colors[Math.min(score,5)] : "#e5e7eb" }} />
+        <div key={i} style={{
+          width: 7, height: 7, borderRadius: "50%",
+          background: i <= score ? colors[Math.min(score,5)] : "#e5e7eb",
+          transition: "background 0.3s",
+        }} />
       ))}
     </div>
   );
 }
 
-function KGGraph({ data }) {
-  const nodeColors = { session: "#3b82f6", event: "#10b981", rule: "#f59e0b" };
-  const nodeSize = { session: 22, event: 14, rule: 16 };
+const LEVEL_COLORS = { 1: "#10b981", 2: "#f59e0b", 3: "#ef4444" };
+const LEVEL_BG    = { 1: "#d1fae5", 2: "#fef3c7", 3: "#fee2e2" };
 
+// ─── STATUS BADGE ───────────────────────────────────────────────────────────
+function StatusBadge({ ok, label }) {
   return (
-    <svg viewBox="0 0 680 360" width="100%" style={{ fontFamily: "var(--font-sans)" }}>
-      <defs>
-        <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-          <path d="M0,0 L0,6 L8,3 z" fill="#94a3b8" />
-        </marker>
-      </defs>
-      {data.edges.map((e, i) => {
-        const src = data.nodes.find(n => n.id === e.src);
-        const dst = data.nodes.find(n => n.id === e.dst);
-        if (!src || !dst) return null;
-        const mx = (src.x + dst.x) / 2;
-        const my = (src.y + dst.y) / 2;
-        const angle = Math.atan2(dst.y - src.y, dst.x - src.x);
-        const sr = nodeSize[src.type] || 14;
-        const dr = nodeSize[dst.type] || 14;
-        const x1 = src.x + Math.cos(angle) * sr;
-        const y1 = src.y + Math.sin(angle) * sr;
-        const x2 = dst.x - Math.cos(angle) * (dr + 6);
-        const y2 = dst.y - Math.sin(angle) * (dr + 6);
-        return (
-          <g key={i}>
-            <line x1={x1} y1={y1} x2={x2} y2={y2} stroke="#cbd5e1" strokeWidth="1.5" markerEnd="url(#arrow)" />
-            <text x={mx} y={my - 4} textAnchor="middle" fontSize="9" fill="#94a3b8">{e.rel}</text>
-          </g>
-        );
-      })}
-      {data.nodes.map(n => (
-        <g key={n.id}>
-          <circle cx={n.x} cy={n.y} r={nodeSize[n.type] || 14} fill={nodeColors[n.type]} opacity="0.15" />
-          <circle cx={n.x} cy={n.y} r={nodeSize[n.type] || 14} fill="none" stroke={nodeColors[n.type]} strokeWidth="1.5" />
-          <text x={n.x} y={n.y + 1} textAnchor="middle" dominantBaseline="middle" fontSize="8" fontWeight="500" fill={nodeColors[n.type]}>
-            {n.type === "session" ? "session" : (n.label || n.id).replace(/_/g," ").slice(0,12)}
-          </text>
-        </g>
-      ))}
-      <g transform="translate(12, 320)">
-        {[["session","#3b82f6"],["event","#10b981"],["rule","#f59e0b"]].map(([label, color], i) => (
-          <g key={label} transform={`translate(${i * 90}, 0)`}>
-            <circle r="5" fill={color} opacity="0.3" stroke={color} strokeWidth="1.5" cx="5" cy="5" />
-            <text x="14" y="9" fontSize="9" fill="#94a3b8">{label}</text>
-          </g>
-        ))}
-      </g>
-    </svg>
+    <span style={{
+      display: "inline-flex", alignItems: "center", gap: 5,
+      padding: "3px 8px", borderRadius: 20, fontSize: 11,
+      background: ok ? "#d1fae5" : "#fee2e2",
+      color: ok ? "#065f46" : "#991b1b",
+    }}>
+      <span style={{ width: 6, height: 6, borderRadius: "50%", background: ok ? "#10b981" : "#ef4444" }} />
+      {label}
+    </span>
   );
 }
 
+// ─── MAIN DASHBOARD ────────────────────────────────────────────────────────
 export default function Dashboard() {
   const [page, setPage] = useState("home");
   const [selectedSession, setSelectedSession] = useState(null);
   const [sessionFilter, setSessionFilter] = useState("all");
-  const [tick, setTick] = useState(0);
 
-  useEffect(() => {
-    const t = setInterval(() => setTick(x => x + 1), 3000);
-    return () => clearInterval(t);
+  // Live data state
+  const [events, setEvents]       = useState([]);
+  const [health, setHealth]       = useState(null);
+  const [queueDepth, setQueueDepth] = useState(0);
+  const [loading, setLoading]     = useState(true);
+  const [lastUpdate, setLastUpdate] = useState(null);
+  const [error, setError]         = useState(null);
+
+  // Fetch from Ingestion
+  const fetchData = useCallback(async () => {
+    try {
+      // 1. Health check
+      const hRes = await fetch(`${INGESTION_URL}/health`);
+      const hData = await hRes.json();
+      setHealth(hData);
+
+      // 2. Queue depth
+      const mRes = await fetch(`${INGESTION_URL}/metrics`);
+      const mData = await mRes.json();
+      setQueueDepth(mData.queue_depth ?? 0);
+
+      // 3. Events via /api/events (if available)
+      try {
+        const eRes = await fetch(`${INGESTION_URL}/api/events?limit=200`);
+        if (eRes.ok) {
+          const eData = await eRes.json();
+          if (eData.success && Array.isArray(eData.events)) {
+            setEvents(eData.events);
+          }
+        }
+      } catch {
+        // /api/events not deployed yet — keep existing events
+      }
+
+      setLastUpdate(new Date());
+      setError(null);
+    } catch (err) {
+      setError("Cannot reach Ingestion API");
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
-  const totalEvents = 47 + tick;
-  const activeSessions = MOCK_SESSIONS.filter(s => s.status === "active").length;
-  const escalations = 6;
+  useEffect(() => {
+    fetchData();
+    const t = setInterval(fetchData, POLL_INTERVAL);
+    return () => clearInterval(t);
+  }, [fetchData]);
 
-  const navItems = [
-    { id: "home", label: "Overview" },
-    { id: "sessions", label: "Sessions" },
-    { id: "rules", label: "Rules" },
-    { id: "pools", label: "Pools" },
-    { id: "metrics", label: "Metrics" },
-  ];
+  // Derived data
+  const sessions      = buildSessions(events);
+  const timeline      = buildTimeline(events);
+  const typeCounts    = buildTypeCounts(events);
+  const activeSessions = sessions.filter(s => {
+    if (!s.lastSeen) return false;
+    return (Date.now() - new Date(s.lastSeen)) < 5 * 60 * 1000;
+  });
+  const escalated     = sessions.filter(s => s.level === 3);
 
   const filteredSessions = sessionFilter === "all"
-    ? MOCK_SESSIONS
-    : MOCK_SESSIONS.filter(s => s.level === parseInt(sessionFilter));
+    ? sessions
+    : sessions.filter(s => s.level === parseInt(sessionFilter));
+
+  const navItems = [
+    { id: "home",     label: "Overview" },
+    { id: "sessions", label: "Sessions" },
+    { id: "events",   label: "Events" },
+    { id: "metrics",  label: "Metrics" },
+  ];
+
+  const redisOk = health?.redis === "up";
 
   return (
-    <div style={{ fontFamily: "var(--font-sans)", minHeight: "100vh", background: "var(--color-background-tertiary)" }}>
-      <div style={{ background: "var(--color-background-primary)", borderBottom: "0.5px solid var(--color-border-tertiary)", padding: "0 24px", display: "flex", alignItems: "center", gap: 32, height: 52 }}>
+    <div style={{ fontFamily: "'IBM Plex Mono', 'Courier New', monospace", minHeight: "100vh", background: "#f8fafc" }}>
+
+      {/* NAV */}
+      <div style={{
+        background: "#0f172a", padding: "0 24px",
+        display: "flex", alignItems: "center", gap: 32, height: 52,
+        borderBottom: "1px solid #1e293b",
+      }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <div style={{ width: 24, height: 24, borderRadius: 6, background: "#1e293b", display: "flex", alignItems: "center", justifyContent: "center" }}>
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-              <circle cx="7" cy="7" r="2.5" fill="#10b981" />
-              <circle cx="7" cy="7" r="5.5" stroke="#10b981" strokeWidth="1" fill="none" opacity="0.4" />
-              <circle cx="7" cy="7" r="6.5" stroke="#10b981" strokeWidth="0.5" fill="none" opacity="0.2" />
-            </svg>
-          </div>
-          <span style={{ fontSize: 13, fontWeight: 500, letterSpacing: "0.02em" }}>Labyrinth</span>
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+            <circle cx="10" cy="10" r="3" fill="#10b981" />
+            <circle cx="10" cy="10" r="7" stroke="#10b981" strokeWidth="1" fill="none" opacity="0.4" />
+            <circle cx="10" cy="10" r="9.5" stroke="#10b981" strokeWidth="0.5" fill="none" opacity="0.2" />
+          </svg>
+          <span style={{ fontSize: 13, fontWeight: 700, color: "#f1f5f9", letterSpacing: "0.05em" }}>LABYRINTH</span>
         </div>
-        <div style={{ display: "flex", gap: 4 }}>
+
+        <div style={{ display: "flex", gap: 2 }}>
           {navItems.map(n => (
             <button key={n.id} onClick={() => { setPage(n.id); setSelectedSession(null); }}
-              style={{ padding: "6px 12px", borderRadius: "var(--border-radius-md)", fontSize: 13, border: "none", cursor: "pointer", fontFamily: "inherit",
-                background: page === n.id ? "var(--color-background-secondary)" : "transparent",
-                color: page === n.id ? "var(--color-text-primary)" : "var(--color-text-secondary)",
-                fontWeight: page === n.id ? 500 : 400 }}>
+              style={{
+                padding: "6px 14px", borderRadius: 6, fontSize: 12, border: "none",
+                cursor: "pointer", fontFamily: "inherit", letterSpacing: "0.04em",
+                background: page === n.id ? "#1e293b" : "transparent",
+                color: page === n.id ? "#f1f5f9" : "#64748b",
+                fontWeight: page === n.id ? 600 : 400,
+                transition: "all 0.15s",
+              }}>
               {n.label}
             </button>
           ))}
         </div>
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
-          <div style={{ width: 7, height: 7, borderRadius: "50%", background: "#10b981", boxShadow: "0 0 0 2px #d1fae5" }} />
-          <span style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>cerebrum · online</span>
+
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12 }}>
+          {lastUpdate && (
+            <span style={{ fontSize: 10, color: "#475569", letterSpacing: "0.04em" }}>
+              updated {lastUpdate.toLocaleTimeString("en-GB", { hour12: false })}
+            </span>
+          )}
+          <StatusBadge ok={redisOk} label={redisOk ? "redis · up" : "redis · down"} />
+          <StatusBadge ok={!error} label={!error ? "ingestion · live" : "ingestion · error"} />
         </div>
       </div>
 
-      <div style={{ padding: "20px 24px", maxWidth: 1100, margin: "0 auto" }}>
+      {/* BODY */}
+      <div style={{ padding: "24px", maxWidth: 1140, margin: "0 auto" }}>
 
-        {/* HOME */}
-        {page === "home" && !selectedSession && (
+        {/* Loading */}
+        {loading && (
+          <div style={{ textAlign: "center", padding: 60, color: "#94a3b8", fontSize: 13 }}>
+            Connecting to Ingestion API…
+          </div>
+        )}
+
+        {/* Error banner */}
+        {error && !loading && (
+          <div style={{
+            background: "#fee2e2", border: "1px solid #fca5a5", borderRadius: 8,
+            padding: "12px 16px", marginBottom: 20, fontSize: 12, color: "#991b1b",
+            display: "flex", alignItems: "center", gap: 8,
+          }}>
+            ⚠ {error} — showing last known data. Check that Ingestion service is running.
+          </div>
+        )}
+
+        {/* ── HOME ── */}
+        {!loading && page === "home" && !selectedSession && (
           <div>
-            <div style={{ marginBottom: 20 }}>
-              <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 4 }}>dynamic labyrinth</div>
-              <div style={{ fontSize: 20, fontWeight: 500 }}>Threat intelligence overview</div>
+            <div style={{ marginBottom: 24 }}>
+              <div style={{ fontSize: 11, color: "#94a3b8", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>
+                live threat intelligence
+              </div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: "#0f172a" }}>Overview</div>
             </div>
 
+            {/* STAT CARDS */}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 20 }}>
               {[
-                { label: "Total events", value: totalEvents, delta: "+12 last hr" },
-                { label: "Active sessions", value: activeSessions, delta: "2 escalated" },
-                { label: "Escalations", value: escalations, delta: "to level 3" },
-                { label: "Rules loaded", value: 15, delta: "all active" },
+                { label: "Total events",    value: events.length,          sub: `${queueDepth} in queue` },
+                { label: "Sessions",        value: sessions.length,        sub: `${activeSessions.length} active` },
+                { label: "Escalated (L3)",  value: escalated.length,       sub: "level 3 sessions" },
+                { label: "Redis queue",     value: queueDepth,             sub: redisOk ? "redis up" : "redis down" },
               ].map(card => (
-                <div key={card.label} style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "12px 16px" }}>
-                  <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 4 }}>{card.label}</div>
-                  <div style={{ fontSize: 24, fontWeight: 500, lineHeight: 1 }}>{card.value}</div>
-                  <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", marginTop: 4 }}>{card.delta}</div>
+                <div key={card.label} style={{
+                  background: "#fff", border: "1px solid #e2e8f0", borderRadius: 10,
+                  padding: "16px 18px",
+                }}>
+                  <div style={{ fontSize: 11, color: "#64748b", marginBottom: 6, letterSpacing: "0.06em" }}>{card.label}</div>
+                  <div style={{ fontSize: 28, fontWeight: 700, color: "#0f172a", lineHeight: 1 }}>{card.value}</div>
+                  <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 5 }}>{card.sub}</div>
                 </div>
               ))}
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 16, marginBottom: 16 }}>
-              <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: 16 }}>
-                <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 12 }}>Event activity</div>
-                <ResponsiveContainer width="100%" height={160}>
-                  <AreaChart data={TIMELINE_DATA}>
-                    <defs>
-                      <linearGradient id="eventGrad" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.2} />
-                        <stop offset="100%" stopColor="#3b82f6" stopOpacity={0} />
-                      </linearGradient>
-                    </defs>
-                    <XAxis dataKey="hour" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
-                    <YAxis tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
-                    <Tooltip contentStyle={{ fontSize: 11, border: "0.5px solid var(--color-border-secondary)", borderRadius: 8, boxShadow: "none" }} />
-                    <Area type="monotone" dataKey="events" stroke="#3b82f6" strokeWidth={1.5} fill="url(#eventGrad)" />
-                  </AreaChart>
-                </ResponsiveContainer>
+            {/* CHARTS */}
+            <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 16, marginBottom: 20 }}>
+              <div style={{ background: "#fff", border: "1px solid #e2e8f0", borderRadius: 10, padding: 18 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 14, color: "#0f172a", letterSpacing: "0.04em" }}>
+                  EVENT ACTIVITY
+                </div>
+                {timeline.length > 0 ? (
+                  <ResponsiveContainer width="100%" height={160}>
+                    <AreaChart data={timeline}>
+                      <defs>
+                        <linearGradient id="grad" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.25} />
+                          <stop offset="100%" stopColor="#3b82f6" stopOpacity={0} />
+                        </linearGradient>
+                      </defs>
+                      <XAxis dataKey="hour" tick={{ fontSize: 9, fontFamily: "inherit" }} axisLine={false} tickLine={false} />
+                      <YAxis tick={{ fontSize: 9, fontFamily: "inherit" }} axisLine={false} tickLine={false} />
+                      <Tooltip contentStyle={{ fontSize: 11, fontFamily: "inherit", border: "1px solid #e2e8f0", borderRadius: 6, boxShadow: "none" }} />
+                      <Area type="monotone" dataKey="events" stroke="#3b82f6" strokeWidth={2} fill="url(#grad)" />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div style={{ height: 160, display: "flex", alignItems: "center", justifyContent: "center", color: "#94a3b8", fontSize: 12 }}>
+                    No events yet — send some data to Ingestion
+                  </div>
+                )}
               </div>
-              <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: 16 }}>
-                <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 12 }}>Top rules triggered</div>
-                <ResponsiveContainer width="100%" height={160}>
-                  <BarChart data={RULES_DATA} layout="vertical">
-                    <XAxis type="number" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
-                    <YAxis dataKey="name" type="category" tick={{ fontSize: 9 }} axisLine={false} tickLine={false} width={80} />
-                    <Tooltip contentStyle={{ fontSize: 11, border: "0.5px solid var(--color-border-secondary)", borderRadius: 8, boxShadow: "none" }} />
-                    <Bar dataKey="count" fill="#f59e0b" radius={[0, 3, 3, 0]} />
-                  </BarChart>
-                </ResponsiveContainer>
+
+              <div style={{ background: "#fff", border: "1px solid #e2e8f0", borderRadius: 10, padding: 18 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 14, color: "#0f172a", letterSpacing: "0.04em" }}>
+                  TOP EVENT TYPES
+                </div>
+                {typeCounts.length > 0 ? (
+                  <ResponsiveContainer width="100%" height={160}>
+                    <BarChart data={typeCounts} layout="vertical">
+                      <XAxis type="number" tick={{ fontSize: 9, fontFamily: "inherit" }} axisLine={false} tickLine={false} />
+                      <YAxis dataKey="name" type="category" tick={{ fontSize: 9, fontFamily: "inherit" }} axisLine={false} tickLine={false} width={90} />
+                      <Tooltip contentStyle={{ fontSize: 11, fontFamily: "inherit", border: "1px solid #e2e8f0", borderRadius: 6, boxShadow: "none" }} />
+                      <Bar dataKey="count" fill="#f59e0b" radius={[0, 3, 3, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div style={{ height: 160, display: "flex", alignItems: "center", justifyContent: "center", color: "#94a3b8", fontSize: 12 }}>
+                    No data yet
+                  </div>
+                )}
               </div>
             </div>
 
-            <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: 16 }}>
-              <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 12 }}>Recent sessions</div>
-              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-                <thead>
-                  <tr style={{ borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
-                    {["IP", "Protocol", "Score", "Level", "Events", "Last seen", ""].map(h => (
-                      <th key={h} style={{ padding: "6px 8px", textAlign: "left", fontWeight: 500, color: "var(--color-text-secondary)", fontSize: 11 }}>{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {MOCK_SESSIONS.map(s => (
-                    <tr key={s.id} style={{ borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
-                      <td style={{ padding: "8px 8px", fontFamily: "var(--font-mono)", fontSize: 11 }}>{s.ip}</td>
-                      <td style={{ padding: "8px 8px" }}><span style={{ background: "var(--color-background-secondary)", padding: "2px 6px", borderRadius: 4, fontSize: 10 }}>{s.protocol}</span></td>
-                      <td style={{ padding: "8px 8px" }}><ScoreDot score={s.score} /></td>
-                      <td style={{ padding: "8px 8px" }}><span style={{ background: LEVEL_BG[s.level], color: LEVEL_COLORS[s.level], padding: "2px 6px", borderRadius: 4, fontSize: 10, fontWeight: 500 }}>L{s.level}</span></td>
-                      <td style={{ padding: "8px 8px", color: "var(--color-text-secondary)" }}>{s.events}</td>
-                      <td style={{ padding: "8px 8px", color: "var(--color-text-tertiary)", fontFamily: "var(--font-mono)", fontSize: 11 }}>{s.last_seen}</td>
-                      <td style={{ padding: "8px 8px" }}>
-                        <button onClick={() => { setSelectedSession(s); setPage("detail"); }}
-                          style={{ fontSize: 11, color: "var(--color-text-info)", border: "none", background: "none", cursor: "pointer", padding: 0, fontFamily: "inherit" }}>
-                          Detail →
-                        </button>
-                      </td>
+            {/* RECENT SESSIONS */}
+            <div style={{ background: "#fff", border: "1px solid #e2e8f0", borderRadius: 10, padding: 18 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 14, color: "#0f172a", letterSpacing: "0.04em" }}>
+                RECENT SESSIONS
+              </div>
+              {sessions.length === 0 ? (
+                <div style={{ padding: "24px 0", textAlign: "center", color: "#94a3b8", fontSize: 12 }}>
+                  No sessions detected yet. Send events to Ingestion to see them here.
+                </div>
+              ) : (
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                  <thead>
+                    <tr style={{ borderBottom: "1px solid #f1f5f9" }}>
+                      {["IP", "Protocol", "Score", "Level", "Events", "Last seen", ""].map(h => (
+                        <th key={h} style={{ padding: "6px 10px", textAlign: "left", fontWeight: 600, color: "#64748b", fontSize: 10, letterSpacing: "0.06em" }}>{h}</th>
+                      ))}
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {sessions.slice(0, 10).map(s => (
+                      <tr key={s.id} style={{ borderBottom: "1px solid #f8fafc" }}>
+                        <td style={{ padding: "10px 10px", fontFamily: "inherit", fontSize: 11, color: "#0f172a" }}>{s.ip}</td>
+                        <td style={{ padding: "10px 10px" }}>
+                          <span style={{ background: "#f1f5f9", padding: "2px 7px", borderRadius: 4, fontSize: 10, color: "#475569" }}>{s.protocol}</span>
+                        </td>
+                        <td style={{ padding: "10px 10px" }}><ScoreDot score={s.score} /></td>
+                        <td style={{ padding: "10px 10px" }}>
+                          <span style={{ background: LEVEL_BG[s.level], color: LEVEL_COLORS[s.level], padding: "2px 7px", borderRadius: 4, fontSize: 10, fontWeight: 700 }}>L{s.level}</span>
+                        </td>
+                        <td style={{ padding: "10px 10px", color: "#64748b" }}>{s.eventCount}</td>
+                        <td style={{ padding: "10px 10px", color: "#94a3b8", fontSize: 11 }}>{fmt(s.lastSeen)}</td>
+                        <td style={{ padding: "10px 10px" }}>
+                          <button onClick={() => { setSelectedSession(s); setPage("detail"); }}
+                            style={{ fontSize: 11, color: "#3b82f6", border: "none", background: "none", cursor: "pointer", fontFamily: "inherit" }}>
+                            Detail →
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
             </div>
           </div>
         )}
 
-        {/* SESSIONS PAGE */}
-        {page === "sessions" && !selectedSession && (
+        {/* ── SESSIONS ── */}
+        {!loading && page === "sessions" && !selectedSession && (
           <div>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-              <div style={{ fontSize: 18, fontWeight: 500 }}>Sessions</div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
+              <div style={{ fontSize: 20, fontWeight: 700, color: "#0f172a" }}>Sessions</div>
               <div style={{ display: "flex", gap: 4 }}>
                 {["all","1","2","3"].map(f => (
                   <button key={f} onClick={() => setSessionFilter(f)}
-                    style={{ padding: "5px 10px", borderRadius: "var(--border-radius-md)", fontSize: 12, fontFamily: "inherit",
-                      border: "0.5px solid var(--color-border-secondary)", cursor: "pointer",
-                      background: sessionFilter === f ? "var(--color-background-secondary)" : "transparent",
-                      color: "var(--color-text-secondary)" }}>
-                    {f === "all" ? "All" : `Level ${f}`}
+                    style={{
+                      padding: "5px 12px", borderRadius: 6, fontSize: 11, fontFamily: "inherit",
+                      border: "1px solid #e2e8f0", cursor: "pointer",
+                      background: sessionFilter === f ? "#0f172a" : "#fff",
+                      color: sessionFilter === f ? "#f1f5f9" : "#64748b",
+                      fontWeight: 500,
+                    }}>
+                    {f === "all" ? "All" : `L${f}`}
                   </button>
                 ))}
               </div>
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {filteredSessions.map(s => (
-                <div key={s.id} style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: "14px 16px", display: "flex", alignItems: "center", gap: 16, cursor: "pointer" }}
-                  onClick={() => { setSelectedSession(s); setPage("detail"); }}>
-                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: s.status === "active" ? "#10b981" : s.status === "idle" ? "#f59e0b" : "#d1d5db", flexShrink: 0 }} />
-                  <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, minWidth: 110 }}>{s.ip}</div>
-                  <span style={{ background: "var(--color-background-secondary)", padding: "2px 6px", borderRadius: 4, fontSize: 10, color: "var(--color-text-secondary)" }}>{s.protocol}</span>
-                  <ScoreDot score={s.score} />
-                  <span style={{ background: LEVEL_BG[s.level], color: LEVEL_COLORS[s.level], padding: "2px 7px", borderRadius: 4, fontSize: 10, fontWeight: 500 }}>Level {s.level}</span>
-                  <div style={{ marginLeft: "auto", fontSize: 11, color: "var(--color-text-tertiary)" }}>{s.events} events · {s.last_seen}</div>
-                  <div style={{ fontSize: 11, color: "var(--color-text-info)" }}>View →</div>
-                </div>
-              ))}
-            </div>
+
+            {filteredSessions.length === 0 ? (
+              <div style={{ textAlign: "center", padding: 60, color: "#94a3b8", fontSize: 13 }}>
+                No sessions found
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {filteredSessions.map(s => (
+                  <div key={s.id}
+                    onClick={() => { setSelectedSession(s); setPage("detail"); }}
+                    style={{
+                      background: "#fff", border: "1px solid #e2e8f0", borderRadius: 10,
+                      padding: "14px 18px", display: "flex", alignItems: "center", gap: 16,
+                      cursor: "pointer", transition: "border-color 0.15s",
+                    }}>
+                    <div style={{
+                      width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
+                      background: (Date.now() - new Date(s.lastSeen)) < 300000 ? "#10b981" : "#d1d5db",
+                    }} />
+                    <div style={{ fontFamily: "inherit", fontSize: 12, minWidth: 120, color: "#0f172a" }}>{s.ip}</div>
+                    <span style={{ background: "#f1f5f9", padding: "2px 7px", borderRadius: 4, fontSize: 10, color: "#475569" }}>{s.protocol}</span>
+                    <ScoreDot score={s.score} />
+                    <span style={{ background: LEVEL_BG[s.level], color: LEVEL_COLORS[s.level], padding: "2px 7px", borderRadius: 4, fontSize: 10, fontWeight: 700 }}>
+                      Level {s.level}
+                    </span>
+                    {s.username && (
+                      <span style={{ fontSize: 11, color: "#475569" }}>user: <b>{s.username}</b></span>
+                    )}
+                    <div style={{ marginLeft: "auto", fontSize: 11, color: "#94a3b8" }}>
+                      {s.eventCount} events · {fmt(s.lastSeen)}
+                    </div>
+                    <div style={{ fontSize: 11, color: "#3b82f6" }}>View →</div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
-        {/* SESSION DETAIL */}
-        {page === "detail" && selectedSession && (
+        {/* ── SESSION DETAIL ── */}
+        {!loading && page === "detail" && selectedSession && (
           <div>
             <button onClick={() => { setSelectedSession(null); setPage("sessions"); }}
-              style={{ fontSize: 12, color: "var(--color-text-secondary)", border: "none", background: "none", cursor: "pointer", padding: 0, marginBottom: 16, fontFamily: "inherit" }}>
-              ← Back to sessions
+              style={{ fontSize: 12, color: "#64748b", border: "none", background: "none", cursor: "pointer", padding: 0, marginBottom: 18, fontFamily: "inherit" }}>
+              ← Back
             </button>
 
-            <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
-              <div style={{ fontSize: 18, fontWeight: 500, fontFamily: "var(--font-mono)" }}>{selectedSession.ip}</div>
-              <span style={{ background: LEVEL_BG[selectedSession.level], color: LEVEL_COLORS[selectedSession.level], padding: "3px 8px", borderRadius: 4, fontSize: 11, fontWeight: 500 }}>Level {selectedSession.level}</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 22 }}>
+              <div style={{ fontSize: 20, fontWeight: 700, fontFamily: "inherit", color: "#0f172a" }}>{selectedSession.ip}</div>
+              <span style={{ background: LEVEL_BG[selectedSession.level], color: LEVEL_COLORS[selectedSession.level], padding: "3px 9px", borderRadius: 5, fontSize: 11, fontWeight: 700 }}>
+                Level {selectedSession.level}
+              </span>
               <ScoreDot score={selectedSession.score} />
+              {selectedSession.username && (
+                <span style={{ fontSize: 12, color: "#475569", background: "#f1f5f9", padding: "3px 8px", borderRadius: 5 }}>
+                  user: {selectedSession.username}
+                </span>
+              )}
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
-              <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: 16 }}>
-                <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 14 }}>Event timeline</div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
-                  {MOCK_EVENTS.map((e, i) => (
-                    <div key={i} style={{ display: "flex", gap: 12, paddingBottom: 12, position: "relative" }}>
-                      <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
-                        <div style={{ width: 10, height: 10, borderRadius: "50%", background: EVENT_COLORS[e.type] || "#94a3b8", flexShrink: 0, marginTop: 2 }} />
-                        {i < MOCK_EVENTS.length - 1 && <div style={{ width: 1, flex: 1, background: "var(--color-border-tertiary)", marginTop: 3 }} />}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+              {/* Event timeline */}
+              <div style={{ background: "#fff", border: "1px solid #e2e8f0", borderRadius: 10, padding: 18, maxHeight: 500, overflowY: "auto" }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 14, color: "#0f172a", letterSpacing: "0.04em" }}>
+                  EVENT TIMELINE ({selectedSession.events?.length || 0})
+                </div>
+                {(selectedSession.events || []).map((e, i) => (
+                  <div key={i} style={{ display: "flex", gap: 12, paddingBottom: 12 }}>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                      <div style={{ width: 9, height: 9, borderRadius: "50%", background: eventColor(e.event_type), flexShrink: 0, marginTop: 2 }} />
+                      {i < selectedSession.events.length - 1 && (
+                        <div style={{ width: 1, flex: 1, background: "#f1f5f9", marginTop: 3 }} />
+                      )}
+                    </div>
+                    <div style={{ flex: 1, paddingBottom: 4 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between" }}>
+                        <span style={{ fontSize: 11, fontWeight: 600, color: eventColor(e.event_type) }}>
+                          {(e.event_type || "unknown").replace("cowrie.", "").replace(/_/g, " ")}
+                        </span>
+                        <span style={{ fontSize: 10, color: "#94a3b8" }}>{fmt(e.timestamp)}</span>
                       </div>
-                      <div style={{ flex: 1, paddingBottom: 4 }}>
-                        <div style={{ display: "flex", justifyContent: "space-between" }}>
-                          <span style={{ fontSize: 11, fontWeight: 500, color: EVENT_COLORS[e.type] || "var(--color-text-secondary)" }}>
-                            {e.type.replace(/_/g, " ")}
-                          </span>
-                          <span style={{ fontSize: 10, color: "var(--color-text-tertiary)", fontFamily: "var(--font-mono)" }}>{e.time}</span>
+                      {(e.username || e.command || e.payload) && (
+                        <div style={{ fontSize: 11, color: "#475569", marginTop: 2 }}>
+                          {e.username && <span style={{ color: "#0f172a", fontWeight: 600, marginRight: 6 }}>{e.username}</span>}
+                          {e.command || e.payload}
                         </div>
-                        <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 1 }}>
-                          {e.username && <span style={{ fontFamily: "var(--font-mono)", color: "var(--color-text-primary)", marginRight: 6 }}>{e.username}</span>}
-                          {e.detail}
-                        </div>
-                      </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Session info */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                <div style={{ background: "#fff", border: "1px solid #e2e8f0", borderRadius: 10, padding: 18 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 14, color: "#0f172a", letterSpacing: "0.04em" }}>
+                    SESSION INFO
+                  </div>
+                  {[
+                    ["IP", selectedSession.ip],
+                    ["Protocol", selectedSession.protocol],
+                    ["Username", selectedSession.username || "—"],
+                    ["Events", selectedSession.eventCount],
+                    ["First seen", fmt(selectedSession.firstSeen)],
+                    ["Last seen", fmt(selectedSession.lastSeen)],
+                    ["Commands", selectedSession.commands?.length || 0],
+                  ].map(([k, v]) => (
+                    <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "7px 0", borderBottom: "1px solid #f8fafc", fontSize: 12 }}>
+                      <span style={{ color: "#64748b" }}>{k}</span>
+                      <span style={{ color: "#0f172a", fontWeight: 500 }}>{v}</span>
                     </div>
                   ))}
                 </div>
-              </div>
 
-              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-                <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: 16 }}>
-                  <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 14 }}>Decisions</div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                    {MOCK_DECISIONS.map((d, i) => (
-                      <div key={i} style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "10px 12px" }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
-                          <span style={{ fontSize: 11, fontWeight: 500, color: d.action.includes("level_3") ? "#ef4444" : d.action.includes("level_2") ? "#f59e0b" : "#6b7280" }}>
-                            {d.action.replace(/_/g, " ")}
-                          </span>
-                          <span style={{ fontSize: 10, color: "var(--color-text-tertiary)", fontFamily: "var(--font-mono)" }}>{d.time}</span>
-                        </div>
-                        <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>rule: {d.rule} · score: {d.score}</div>
+                {selectedSession.commands?.length > 0 && (
+                  <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 10, padding: 18 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 12, color: "#10b981", letterSpacing: "0.04em" }}>
+                      COMMANDS
+                    </div>
+                    {selectedSession.commands.map((cmd, i) => (
+                      <div key={i} style={{ fontSize: 12, color: "#94a3b8", padding: "3px 0", fontFamily: "inherit" }}>
+                        <span style={{ color: "#10b981", marginRight: 8 }}>$</span>{cmd}
                       </div>
                     ))}
                   </div>
-                </div>
-
-                <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: 16 }}>
-                  <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 4 }}>Knowledge graph</div>
-                  <KGGraph data={MOCK_KG} />
-                </div>
+                )}
               </div>
             </div>
           </div>
         )}
 
-        {/* RULES */}
-        {page === "rules" && (
+        {/* ── EVENTS ── */}
+        {!loading && page === "events" && (
           <div>
-            <div style={{ fontSize: 18, fontWeight: 500, marginBottom: 16 }}>Rules</div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {[
-                { id: "ssh_brute_force", desc: "6+ auth failures in 5min", delta: 3, action: "escalate_to_level_2", hits: 2 },
-                { id: "ssh_root_attempt", desc: "Auth attempt as root", delta: 1, action: "flag", hits: 3 },
-                { id: "ssh_successful_login", desc: "Successful SSH login", delta: 4, action: "escalate_to_level_3", hits: 4 },
-                { id: "high_skill_persistent_attacker", desc: "score ≥ 4 and session active > 5min", delta: 2, action: "escalate_to_level_3", hits: 7 },
-                { id: "command_dangerous", desc: "Commands: wget, curl, bash, nc", delta: 3, action: "escalate_to_level_2", hits: 0 },
-                { id: "port_scan_detected", desc: "20+ connections in 1min", delta: 2, action: "flag", hits: 1 },
-                { id: "repeated_session", desc: "Same IP, 3+ sessions", delta: 2, action: "escalate_to_level_2", hits: 0 },
-              ].map(r => (
-                <div key={r.id} style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: "12px 16px", display: "flex", alignItems: "center", gap: 16 }}>
-                  <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: 12, fontWeight: 500, fontFamily: "var(--font-mono)" }}>{r.id}</div>
-                    <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 2 }}>{r.desc}</div>
-                  </div>
-                  <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", minWidth: 60 }}>Δ score +{r.delta}</div>
-                  <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: r.action.includes("3") ? "#fee2e2" : r.action.includes("2") ? "#fef3c7" : "#f3f4f6", color: r.action.includes("3") ? "#ef4444" : r.action.includes("2") ? "#d97706" : "#6b7280", fontWeight: 500 }}>
-                    {r.action.replace(/_/g, " ")}
-                  </span>
-                  <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", minWidth: 50, textAlign: "right" }}>{r.hits} hits</div>
-                </div>
-              ))}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
+              <div style={{ fontSize: 20, fontWeight: 700, color: "#0f172a" }}>
+                All Events <span style={{ fontSize: 14, fontWeight: 400, color: "#94a3b8" }}>({events.length})</span>
+              </div>
+              <button onClick={fetchData}
+                style={{
+                  fontSize: 11, padding: "6px 14px", borderRadius: 6,
+                  border: "1px solid #e2e8f0", cursor: "pointer", background: "#fff",
+                  color: "#64748b", fontFamily: "inherit",
+                }}>
+                ↻ Refresh
+              </button>
             </div>
+
+            {events.length === 0 ? (
+              <div style={{ textAlign: "center", padding: 60, color: "#94a3b8", fontSize: 13 }}>
+                <div style={{ marginBottom: 12, fontSize: 24 }}>📭</div>
+                No events received yet.<br />
+                <span style={{ fontSize: 11, marginTop: 8, display: "block" }}>
+                  Send events to: <code style={{ background: "#f1f5f9", padding: "2px 6px", borderRadius: 4 }}>POST {INGESTION_URL}/ingest/event</code>
+                </span>
+              </div>
+            ) : (
+              <div style={{ background: "#fff", border: "1px solid #e2e8f0", borderRadius: 10, overflow: "hidden" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                  <thead style={{ background: "#f8fafc" }}>
+                    <tr>
+                      {["Time", "Type", "Src IP", "Username", "Command / Payload", "Protocol"].map(h => (
+                        <th key={h} style={{ padding: "10px 14px", textAlign: "left", fontWeight: 600, color: "#64748b", fontSize: 10, letterSpacing: "0.06em", borderBottom: "1px solid #e2e8f0" }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[...events].reverse().slice(0, 100).map((e, i) => (
+                      <tr key={i} style={{ borderBottom: "1px solid #f8fafc" }}>
+                        <td style={{ padding: "9px 14px", color: "#94a3b8", whiteSpace: "nowrap" }}>{fmt(e.timestamp)}</td>
+                        <td style={{ padding: "9px 14px" }}>
+                          <span style={{ color: eventColor(e.event_type), fontWeight: 600 }}>
+                            {(e.event_type || "unknown").replace("cowrie.", "")}
+                          </span>
+                        </td>
+                        <td style={{ padding: "9px 14px", color: "#0f172a" }}>{e.src_ip || "—"}</td>
+                        <td style={{ padding: "9px 14px", color: "#475569" }}>{e.username || "—"}</td>
+                        <td style={{ padding: "9px 14px", color: "#475569", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {e.command || e.payload || "—"}
+                        </td>
+                        <td style={{ padding: "9px 14px" }}>
+                          <span style={{ background: "#f1f5f9", padding: "2px 6px", borderRadius: 4, fontSize: 10, color: "#475569" }}>{e.protocol || "—"}</span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         )}
 
-        {/* POOLS */}
-        {page === "pools" && (
+        {/* ── METRICS ── */}
+        {!loading && page === "metrics" && (
           <div>
-            <div style={{ fontSize: 18, fontWeight: 500, marginBottom: 16 }}>Container pools</div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, marginBottom: 24 }}>
-              {POOL_DATA.map(p => (
-                <div key={p.name} style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: 16 }}>
-                  <div style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)", marginBottom: 8 }}>{p.name}</div>
-                  <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-                    <div style={{ flex: 1, background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "8px 10px", textAlign: "center" }}>
-                      <div style={{ fontSize: 18, fontWeight: 500 }}>{p.total}</div>
-                      <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>total</div>
-                    </div>
-                    <div style={{ flex: 1, background: "#fef9c3", borderRadius: "var(--border-radius-md)", padding: "8px 10px", textAlign: "center" }}>
-                      <div style={{ fontSize: 18, fontWeight: 500, color: "#d97706" }}>{p.busy}</div>
-                      <div style={{ fontSize: 10, color: "#b45309" }}>busy</div>
-                    </div>
-                    <div style={{ flex: 1, background: "#d1fae5", borderRadius: "var(--border-radius-md)", padding: "8px 10px", textAlign: "center" }}>
-                      <div style={{ fontSize: 18, fontWeight: 500, color: "#059669" }}>{p.idle}</div>
-                      <div style={{ fontSize: 10, color: "#047857" }}>idle</div>
-                    </div>
-                  </div>
-                  <div style={{ height: 6, borderRadius: 3, background: "var(--color-background-secondary)", overflow: "hidden" }}>
-                    <div style={{ height: "100%", width: `${(p.busy / p.total) * 100}%`, background: p.busy === p.total ? "#ef4444" : "#f59e0b", borderRadius: 3 }} />
-                  </div>
-                  <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 4 }}>{Math.round((p.busy / p.total) * 100)}% utilization</div>
-                </div>
-              ))}
-            </div>
-            <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: 16 }}>
-              <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 12 }}>nginx routing map (preview)</div>
-              <pre style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--color-text-secondary)", background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "12px 14px", overflowX: "auto", margin: 0 }}>
-{`map $cookie_dlsess $honeytrap_upstream {
-    default "level1_pool";
-    "dlsess_a3f2b1c4" "10.0.2.7:8080";
-    "dlsess_9e8d7c6b" "10.0.2.12:8080";
-    "dlsess_1a2b3c4d" "10.0.2.21:8080";
-}`}
-              </pre>
-            </div>
-          </div>
-        )}
+            <div style={{ fontSize: 20, fontWeight: 700, color: "#0f172a", marginBottom: 20 }}>Metrics</div>
 
-        {/* METRICS */}
-        {page === "metrics" && (
-          <div>
-            <div style={{ fontSize: 18, fontWeight: 500, marginBottom: 16 }}>Metrics</div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 20 }}>
               {[
-                { label: "Avg events/session", value: "9.4" },
-                { label: "Escalation rate", value: "40%" },
-                { label: "Mean skill score", value: "2.4" },
-                { label: "Engagement ratio", value: "0.73" },
+                { label: "Total events",   value: events.length },
+                { label: "Unique IPs",     value: new Set(events.map(e => e.src_ip)).size },
+                { label: "Queue depth",    value: queueDepth },
+                { label: "Sessions",       value: sessions.length },
               ].map(m => (
-                <div key={m.label} style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "12px 16px" }}>
-                  <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 4 }}>{m.label}</div>
-                  <div style={{ fontSize: 24, fontWeight: 500 }}>{m.value}</div>
+                <div key={m.label} style={{ background: "#fff", border: "1px solid #e2e8f0", borderRadius: 10, padding: "16px 18px" }}>
+                  <div style={{ fontSize: 11, color: "#64748b", marginBottom: 6, letterSpacing: "0.06em" }}>{m.label}</div>
+                  <div style={{ fontSize: 28, fontWeight: 700, color: "#0f172a" }}>{m.value}</div>
                 </div>
               ))}
             </div>
+
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
-              <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: 16 }}>
-                <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 12 }}>Escalations over time</div>
+              <div style={{ background: "#fff", border: "1px solid #e2e8f0", borderRadius: 10, padding: 18 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 14, color: "#0f172a", letterSpacing: "0.04em" }}>EVENTS OVER TIME</div>
                 <ResponsiveContainer width="100%" height={180}>
-                  <LineChart data={[
-                    { t: "22h", v: 1 }, { t: "23h", v: 2 }, { t: "00h", v: 0 },
-                    { t: "01h", v: 3 }, { t: "now", v: 6 },
-                  ]}>
-                    <XAxis dataKey="t" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
-                    <YAxis tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
-                    <Tooltip contentStyle={{ fontSize: 11, border: "0.5px solid var(--color-border-secondary)", borderRadius: 8, boxShadow: "none" }} />
-                    <Line type="monotone" dataKey="v" stroke="#ef4444" strokeWidth={1.5} dot={{ r: 3, fill: "#ef4444" }} />
-                  </LineChart>
+                  <AreaChart data={timeline}>
+                    <defs>
+                      <linearGradient id="g2" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor="#10b981" stopOpacity={0.2} />
+                        <stop offset="100%" stopColor="#10b981" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <XAxis dataKey="hour" tick={{ fontSize: 9, fontFamily: "inherit" }} axisLine={false} tickLine={false} />
+                    <YAxis tick={{ fontSize: 9, fontFamily: "inherit" }} axisLine={false} tickLine={false} />
+                    <Tooltip contentStyle={{ fontSize: 11, fontFamily: "inherit", border: "1px solid #e2e8f0", borderRadius: 6, boxShadow: "none" }} />
+                    <Area type="monotone" dataKey="events" stroke="#10b981" strokeWidth={2} fill="url(#g2)" />
+                  </AreaChart>
                 </ResponsiveContainer>
               </div>
-              <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: 16 }}>
-                <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 12 }}>Events by type</div>
+
+              <div style={{ background: "#fff", border: "1px solid #e2e8f0", borderRadius: 10, padding: 18 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 14, color: "#0f172a", letterSpacing: "0.04em" }}>EVENTS BY TYPE</div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                  {[
-                    { type: "command_input", count: 17, color: "#3b82f6" },
-                    { type: "connection_new", count: 12, color: "#8b5cf6" },
-                    { type: "authentication_success", count: 8, color: "#10b981" },
-                    { type: "connection_closed", count: 7, color: "#6b7280" },
-                    { type: "authentication_failed", count: 3, color: "#ef4444" },
-                  ].map(e => (
-                    <div key={e.type} style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                      <div style={{ width: 8, height: 8, borderRadius: "50%", background: e.color, flexShrink: 0 }} />
-                      <div style={{ fontSize: 11, color: "var(--color-text-secondary)", flex: 1 }}>{e.type.replace(/_/g, " ")}</div>
+                  {typeCounts.map(e => (
+                    <div key={e.name} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <div style={{ width: 8, height: 8, borderRadius: "50%", background: eventColor(e.full), flexShrink: 0 }} />
+                      <div style={{ fontSize: 11, color: "#64748b", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.name}</div>
                       <div style={{ flex: 2 }}>
-                        <div style={{ height: 4, borderRadius: 2, background: "var(--color-background-secondary)", overflow: "hidden" }}>
-                          <div style={{ height: "100%", width: `${(e.count / 17) * 100}%`, background: e.color, borderRadius: 2 }} />
+                        <div style={{ height: 4, borderRadius: 2, background: "#f1f5f9", overflow: "hidden" }}>
+                          <div style={{ height: "100%", width: `${(e.count / (typeCounts[0]?.count || 1)) * 100}%`, background: eventColor(e.full), borderRadius: 2 }} />
                         </div>
                       </div>
-                      <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", minWidth: 20, textAlign: "right" }}>{e.count}</div>
+                      <div style={{ fontSize: 11, color: "#94a3b8", minWidth: 24, textAlign: "right" }}>{e.count}</div>
                     </div>
                   ))}
+                  {typeCounts.length === 0 && (
+                    <div style={{ color: "#94a3b8", fontSize: 12, textAlign: "center", padding: 24 }}>No data yet</div>
+                  )}
                 </div>
+              </div>
+            </div>
+
+            {/* API status */}
+            <div style={{ marginTop: 16, background: "#fff", border: "1px solid #e2e8f0", borderRadius: 10, padding: 18 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 12, color: "#0f172a", letterSpacing: "0.04em" }}>INGESTION API STATUS</div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12 }}>
+                {[
+                  { label: "Status",      value: health?.status || "—" },
+                  { label: "Redis",       value: health?.redis || "—" },
+                  { label: "Queue depth", value: health?.queue_depth ?? "—" },
+                ].map(r => (
+                  <div key={r.label} style={{ background: "#f8fafc", borderRadius: 8, padding: "12px 14px" }}>
+                    <div style={{ fontSize: 10, color: "#94a3b8", marginBottom: 4, letterSpacing: "0.06em" }}>{r.label}</div>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: "#0f172a" }}>{String(r.value)}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ marginTop: 12, fontSize: 11, color: "#94a3b8" }}>
+                Polling {INGESTION_URL} every {POLL_INTERVAL/1000}s
               </div>
             </div>
           </div>
         )}
+
       </div>
     </div>
   );
